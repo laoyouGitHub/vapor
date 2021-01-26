@@ -1,60 +1,45 @@
+/// `Middleware` is placed between the server and your router. It is capable of
+/// mutating both incoming requests and outgoing responses. `Middleware` can choose
+/// to pass requests on to the next `Middleware` in a chain, or they can short circuit and
+/// return a custom `Response` if desired.
 public protocol Middleware {
-    func respond(to request: Request, chainingTo next: Responder) throws -> Future<Response>
+    /// Called with each `Request` that passes through this middleware.
+    /// - parameters:
+    ///     - request: The incoming `Request`.
+    ///     - next: Next `Responder` in the chain, potentially another middleware or the main router.
+    /// - returns: An asynchronous `Response`.
+    func respond(to request: Request, chainingTo next: Responder) -> EventLoopFuture<Response>
 }
 
-/// A wrapper that applies the supplied middleware to a responder.
-///
-/// Note: internal since it is exposed through `makeResponder` extensions.
-final class MiddlewareResponder: Responder {
-    /// The middleware to apply.
-    let middleware: Middleware
-
-    /// The actual responder.
-    let chained: Responder
-
-    /// Creates a new middleware responder.
-    init(middleware: Middleware, chained: Responder) {
-        self.middleware = middleware
-        self.chained = chained
-    }
-
-    /// Responder conformance.
-    public func respond(to req: Request) throws -> Future<Response> {
-        return try middleware.respond(to: req, chainingTo: chained)
-    }
-}
-
-// MARK: Convenience
-
-extension Middleware {
-    /// Converts a middleware into a responder by chaining it to an actual responder.
-    public func makeResponder(chainedTo responder: Responder) -> Responder {
-        return MiddlewareResponder(middleware: self, chained: responder)
-    }
-}
-
-/// Extension on [Middleware]
 extension Array where Element == Middleware {
-    /// Converts an array of middleware into a responder by
-    /// chaining them to an actual responder.
-    public func makeResponder(chainedto responder: Responder) -> Responder {
+    /// Wraps a `Responder` in an array of `Middleware` creating a new `Responder`.
+    /// - note: The array of middleware must be `[Middleware]` not `[M] where M: Middleware`.
+    public func makeResponder(chainingTo responder: Responder) -> Responder {
         var responder = responder
-        for middleware in self {
-            responder = middleware.makeResponder(chainedTo: responder)
+        for middleware in reversed() {
+            responder = middleware.makeResponder(chainingTo: responder)
         }
         return responder
     }
 }
 
-/// Extension on [ConcreteMiddleware]
-extension Array where Element: Middleware {
-    /// Converts an array of middleware into a responder by
-    /// chaining them to an actual responder.
-    public func makeResponder(chainedto responder: Responder) -> Responder {
-        var responder = responder
-        for middleware in self {
-            responder = middleware.makeResponder(chainedTo: responder)
-        }
-        return responder
+public extension Middleware {
+    /// Wraps a `Responder` in a single `Middleware` creating a new `Responder`.
+    func makeResponder(chainingTo responder: Responder) -> Responder {
+        return HTTPMiddlewareResponder(middleware: self, responder: responder)
+    }
+}
+
+private struct HTTPMiddlewareResponder: Responder {
+    var middleware: Middleware
+    var responder: Responder
+    
+    init(middleware: Middleware, responder: Responder) {
+        self.middleware = middleware
+        self.responder = responder
+    }
+    
+    func respond(to request: Request) -> EventLoopFuture<Response> {
+        return self.middleware.respond(to: request, chainingTo: self.responder)
     }
 }

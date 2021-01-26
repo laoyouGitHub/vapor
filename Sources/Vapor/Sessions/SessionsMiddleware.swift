@@ -1,68 +1,97 @@
-/// Checks the cookies for each `Request`
-public final class SessionsMiddleware: Middleware, Service {
+/// Uses HTTP cookies to save and restore sessions for connecting clients.
+///
+/// If a cookie matching the configured cookie name is found on an incoming request,
+/// the value will be used as an identifier to find the associated `Session`.
+///
+/// If a session is used during a request (`Request.session()`), a cookie will be set
+/// on the outgoing response with the session's unique identifier. This cookie must be
+/// returned on the next request to restore the session.
+///
+///     var middlewareConfig = MiddlewareConfig()
+///     middlewareConfig.use(SessionsMiddleware.self)
+///     services.register(middlewareConfig)
+///
+/// See `SessionsConfig` and `Sessions` for more information.
+public final class SessionsMiddleware: Middleware {
     /// The cookie to work with
-    let cookieName: String
+    let configuration: SessionsConfiguration
 
-    /// Creates new cookies
-    public let sessions: Sessions
+    /// Session store.
+    public let session: SessionDriver
 
     /// Creates a new `SessionsMiddleware`.
-    public init(cookieName: String, sessions: Sessions) {
-        self.cookieName = cookieName
-        self.sessions = sessions
+    ///
+    /// - parameters:
+    ///     - sessions: `Sessions` implementation to use for fetching and storing sessions.
+    ///     - configuration: `SessionsConfiguration` to use for naming and creating cookie values.
+    public init(
+        session: SessionDriver,
+        configuration: SessionsConfiguration = .default()
+    ) {
+        self.session = session
+        self.configuration = configuration
     }
 
     /// See `Middleware.respond`
-    public func respond(to request: Request, chainingTo next: Responder) throws -> Future<Response> {
-        /// Create a session cache
-        let cache = try request.privateContainer.make(SessionCache.self)
-        cache.middlewareFlag = true
+    public func respond(to request: Request, chainingTo next: Responder) -> EventLoopFuture<Response> {
+        // Signal middleware has been added.
+        request._sessionCache.middlewareFlag = true
 
-        /// Generate a response for the request
-        func respond() throws -> Future<Response> {
-            return try next.respond(to: request).flatMap(to: Response.self) { res in
-                if let session = cache.session {
-                    /// A session exists or has been created. we must
-                    /// set a cookie value on the response
-                    return try self.sessions.updateSession(session).map(to: Response.self) { value in
-                        res.http.cookies[self.cookieName] = value.id.flatMap(HTTPCookieValue.init)
-                        return res
-                    }
-                } else if let cookieValue = request.http.cookies[self.cookieName] {
-                    /// Yhe request had a session cookie, but now there is no session.
-                    /// we need to perform cleanup.
-                    return try self.sessions.destroySession(sessionID: cookieValue.string).map(to: Response.self) {
-                        res.http.cookies[self.cookieName] = .expired
-                        return res
-                    }
+        // Check for an existing session
+        if let cookieValue = request.cookies[self.configuration.cookieName] {
+            // A cookie value exists, get the session for it.
+            let id = SessionID(string: cookieValue.string)
+            return self.session.readSession(id, for: request).flatMap { data in
+                if let data = data {
+                    // Session found, restore data and id.
+                    request._sessionCache.session = .init(id: id, data: data)
                 } else {
-                    /// no session or existing cookie
-                    return Future.map(on: request) { res }
+                    // Session id not found, create new session.
+                    request._sessionCache.session = .init()
+                }
+                return next.respond(to: request).flatMap { res in
+                    return self.addCookies(to: res, for: request)
                 }
             }
-        }
-
-        /// Check for an existing session
-        if let cookieValue = request.http.cookies[cookieName] {
-            /// A cookie value exists, get the session for it.
-            return try sessions.readSession(sessionID: cookieValue.string).flatMap(to: Response.self) { session in
-                cache.session = session
-                return try respond()
-            }
         } else {
-            /// No cookie value exists, simply respond.
-            return try respond()
+            // No cookie value exists, simply respond.
+            return next.respond(to: request).flatMap { response in
+                return self.addCookies(to: response, for: request)
+            }
         }
     }
-}
 
-extension SessionsMiddleware: ServiceType {
-    /// See `ServiceType.makeService(for:)`
-    public static func makeService(for container: Container) throws -> SessionsMiddleware {
-        let config = try container.make(SessionsConfig.self)
-        return try .init(
-            cookieName: config.cookieName,
-            sessions: container.make()
-        )
+    /// Adds session cookie to response or clears if session was deleted.
+    private func addCookies(to response: Response, for request: Request) -> EventLoopFuture<Response> {
+        if let session = request._sessionCache.session, session.isValid {
+            // A session exists or has been created. we must
+            // set a cookie value on the response
+            let createOrUpdate: EventLoopFuture<SessionID>
+            if let id = session.id {
+                // A cookie exists, just update this session.
+                createOrUpdate = self.session.updateSession(id, to: session.data, for: request)
+            } else {
+                // No cookie, this is a new session.
+                createOrUpdate = self.session.createSession(session.data, for: request)
+            }
+
+            // After create or update, set cookie on the response.
+            return createOrUpdate.map { id in
+                // the session has an id, set the cookie
+                response.cookies[self.configuration.cookieName] = self.configuration.cookieFactory(id)
+                return response
+            }
+        } else if let cookieValue = request.cookies[self.configuration.cookieName] {
+            // The request had a session cookie, but now there is no valid session.
+            // we need to perform cleanup.
+            let id = SessionID(string: cookieValue.string)
+            return self.session.deleteSession(id, for: request).map {
+                response.cookies[self.configuration.cookieName] = .expired
+                return response
+            }
+        } else {
+            // no session or existing cookie
+            return request.eventLoop.makeSucceededFuture(response)
+        }
     }
 }

@@ -1,44 +1,44 @@
-import Async
-import Bits
-import COperatingSystem
-//import HTTP
-import Dispatch
-import Foundation
-
-/// Services files from the public folder.
-public final class FileMiddleware: Middleware, Service {
+/// Serves static files from a public directory.
+///
+/// `FileMiddleware` will default to `DirectoryConfig`'s working directory with `"/Public"` appended.
+public final class FileMiddleware: Middleware {
     /// The public directory.
-    /// note: does _not_ end with a slash
-    let publicDirectory: String
+    /// - note: Must end with a slash.
+    private let publicDirectory: String
 
-    public var webTypes = [MediaType]()
-
-    /// Creates a new filemiddleware.
+    /// Creates a new `FileMiddleware`.
     public init(publicDirectory: String) {
         self.publicDirectory = publicDirectory.hasSuffix("/") ? publicDirectory : publicDirectory + "/"
     }
 
-    /// See Middleware.respond.
-    public func respond(to req: Request, chainingTo next: Responder) throws -> Future<Response> {
-        var path = req.http.url.path
-        if path.hasPrefix("/") {
+    /// See `Middleware`.
+    public func respond(to request: Request, chainingTo next: Responder) -> EventLoopFuture<Response> {
+        // make a copy of the percent-decoded path
+        guard var path = request.url.path.removingPercentEncoding else {
+            return request.eventLoop.makeFailedFuture(Abort(.badRequest))
+        }
+
+        // path must be relative.
+        while path.hasPrefix("/") {
             path = String(path.dropFirst())
         }
+
+        // protect against relative paths
         guard !path.contains("../") else {
-            throw Abort(.forbidden)
+            return request.eventLoop.makeFailedFuture(Abort(.forbidden))
         }
 
+        // create absolute file path
         let filePath = self.publicDirectory + path
 
+        // check if file exists and is not a directory
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: filePath, isDirectory: &isDir) else {
-            return try next.respond(to: req)
+        guard FileManager.default.fileExists(atPath: filePath, isDirectory: &isDir), !isDir.boolValue else {
+            return next.respond(to: request)
         }
 
-        guard !isDir.boolValue else {
-            return try next.respond(to: req)
-        }
-
-        return try req.streamFile(at: filePath)
+        // stream the file
+        let res = request.fileio.streamFile(at: filePath)
+        return request.eventLoop.makeSucceededFuture(res)
     }
 }

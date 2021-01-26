@@ -1,69 +1,50 @@
-/// Something that is convertible between a Cookie and an instance.
+/// Sessions are a method for associating data with a client accessing your app.
+///
+/// Each session has a unique identifier that is used to look it up with each request
+/// to your app. This is usually done via HTTP cookies.
+///
+/// See `Request.session()` and `SessionsMiddleware` for more information.
 public final class Session {
-    /// The cookie value
-    public var id: String?
+    /// This session's unique identifier. Usually a cookie value.
+    public var id: SessionID?
 
-    /// This session's data
+    /// This session's data.
     public var data: SessionData
 
-    /// Create a new session.
-    public init(id: String? = nil, data: SessionData = .init()) {
+    /// `true` if this session is still valid.
+    var isValid: Bool
+
+    /// Create a new `Session`.
+    ///
+    /// Normally you will use `Request.session()` to do this.
+    public init(id: SessionID? = nil, data: SessionData = .init()) {
         self.id = id
         self.data = data
+        self.isValid = true
+    }
+
+    /// Invalidates the current session, removing persisted data from the session driver
+    /// and invalidating the cookie.
+    public func destroy() {
+        self.isValid = false
     }
 }
 
-/// Codable session data.
-public struct SessionData: Codable {
-    /// Session codable object storage.
-    internal var storage: [String: String]
-
-    /// Create a new, empty session data.
-    public init() {
-        storage = [:]
+public struct SessionID: Equatable, Hashable {
+    public let string: String
+    public init(string: String) {
+        self.string = string
     }
+}
 
-    /// See Decodable.init
+extension SessionID: Codable {
     public init(from decoder: Decoder) throws {
-        storage = try [String: String].init(from: decoder)
+        let container = try decoder.singleValueContainer()
+        try self.init(string: container.decode(String.self))
     }
 
-    /// See Encodable.encode
     public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: String.self)
-        for (key, val) in storage {
-            try container.encode(val, forKey: key)
-        }
+        var container = encoder.singleValueContainer()
+        try container.encode(self.string)
     }
 }
-
-extension Session {
-    /// Convenience [String: String] accessor.
-    public subscript(_ key: String) -> String? {
-        get {
-            return data.storage[key]
-        }
-        set {
-            data.storage[key] = newValue
-        }
-    }
-}
-
-extension String: CodingKey {
-    public var stringValue: String {
-        return self
-    }
-
-    public var intValue: Int? {
-        return Int(self)
-    }
-
-    public init?(stringValue: String) {
-        self = stringValue
-    }
-
-    public init?(intValue: Int) {
-        self = intValue.description
-    }
-}
-

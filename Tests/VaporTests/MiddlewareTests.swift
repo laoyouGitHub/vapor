@@ -1,31 +1,32 @@
-import Vapor
-import XCTest
+import XCTVapor
 
-class MiddlewareTests : XCTestCase {
-    // https://github.com/vapor/vapor/issues/1371
-    func testNotConfigurable() throws {
-        final class MyMiddleware: Middleware {
-            var flag = false
-            func respond(to request: Request, chainingTo next: Responder) throws -> Future<Response> {
-                flag = true
-                return try next.respond(to: request)
+final class MiddlewareTests: XCTestCase {
+    func testMiddlewareOrder() throws {
+        final class OrderMiddleware: Middleware {
+            static var order: [String] = []
+            let pos: String
+            init(_ pos: String) {
+                self.pos = pos
+            }
+            func respond(to req: Request, chainingTo next: Responder) -> EventLoopFuture<Response> {
+                OrderMiddleware.order.append(pos)
+                return next.respond(to: req)
             }
         }
 
-        let myMiddleware = MyMiddleware()
-        var services = Services.default()
-        var middlewareConfig = MiddlewareConfig()
-        middlewareConfig.use(myMiddleware)
-        services.register(middlewareConfig)
+        let app = Application(.testing)
+        defer { app.shutdown() }
 
-        let app = try Application(services: services)
+        app.grouped(
+            OrderMiddleware("a"), OrderMiddleware("b"), OrderMiddleware("c")
+        ).get("order") { req -> String in
+            return "done"
+        }
 
-        let req = Request(using: app)
-        _ = try app.make(Responder.self).respond(to: req).wait()
-        XCTAssert(myMiddleware.flag == true)
+        try app.testable().test(.GET, "/order") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(OrderMiddleware.order, ["a", "b", "c"])
+            XCTAssertEqual(res.body.string, "done")
+        }
     }
-
-    static let allTests = [
-        ("testNotConfigurable", testNotConfigurable),
-    ]
 }

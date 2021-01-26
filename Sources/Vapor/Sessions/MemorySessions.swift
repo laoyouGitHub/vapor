@@ -1,57 +1,61 @@
-import Bits
-import Crypto
-
 /// Simple in-memory sessions implementation.
-public final class MemorySessions: Sessions {
-    /// The internal storage.
-    private var sessions: [String: Session]
-
-    /// This session's event loop.
-    private let eventLoop: EventLoop
-
-    /// MemorySession with basic cookie factory.
-    public static func `default`(on worker: Worker) -> MemorySessions {
-        return .init(on: worker)
-    }
-
-    /// Create a new `MemorySessions` with the supplied cookie factory.
-    public init(on worker: Worker) {
-        self.eventLoop = worker.eventLoop
-        sessions = [:]
-    }
-
-    /// See Sessions.readSession
-    public func readSession(sessionID: String) throws -> Future<Session?> {
-        let session = sessions[sessionID]
-        return Future.map(on: eventLoop) { session }
-    }
-
-    /// See Sessions.destroySession
-    public func destroySession(sessionID: String) throws -> Future<Void> {
-        sessions[sessionID] = nil
-        return .done(on: eventLoop)
-    }
-
-    /// See Sessions.updateSession
-    public func updateSession(_ session: Session) throws -> Future<Session> {
-        let sessionID: String
-        if let existing = session.id {
-            sessionID = existing
-        } else {
-            sessionID = try CryptoRandom().generateData(count: 16).base64EncodedString()
+public struct MemorySessions: SessionDriver {
+    public let storage: Storage
+    
+    public final class Storage {
+        public var sessions: [SessionID: SessionData]
+        public let queue: DispatchQueue
+        public init() {
+            self.sessions = [:]
+            self.queue = DispatchQueue(label: "MemorySessions.Storage")
         }
-        session.id = sessionID
-        sessions[sessionID] = session
-        return Future.map(on: eventLoop) { session }
     }
-}
 
-extension MemorySessions: ServiceType {
-    /// See `ServiceType.serviceSupports`
-    public static var serviceSupports: [Any.Type] { return [Sessions.self] }
+    public init(storage: Storage) {
+        self.storage = storage
+    }
 
-    /// See `ServiceType.makeService(for:)`
-    public static func makeService(for worker: Container) throws -> MemorySessions {
-        return .default(on: worker)
+    public func createSession(
+        _ data: SessionData,
+        for request: Request
+    ) -> EventLoopFuture<SessionID> {
+        let sessionID = self.generateID()
+        self.storage.queue.sync {
+            self.storage.sessions[sessionID] = data
+        }
+        return request.eventLoop.makeSucceededFuture(sessionID)
+    }
+    
+    public func readSession(
+        _ sessionID: SessionID,
+        for request: Request
+    ) -> EventLoopFuture<SessionData?> {
+        let session = self.storage.queue.sync { self.storage.sessions[sessionID] }
+        return request.eventLoop.makeSucceededFuture(session)
+    }
+    
+    public func updateSession(
+        _ sessionID: SessionID,
+        to data: SessionData,
+        for request: Request
+    ) -> EventLoopFuture<SessionID> {
+        self.storage.queue.sync { self.storage.sessions[sessionID] = data }
+        return request.eventLoop.makeSucceededFuture(sessionID)
+    }
+    
+    public func deleteSession(
+        _ sessionID: SessionID,
+        for request: Request
+    ) -> EventLoopFuture<Void> {
+        self.storage.queue.sync { self.storage.sessions[sessionID] = nil }
+        return request.eventLoop.makeSucceededFuture(())
+    }
+    
+    private func generateID() -> SessionID {
+        var bytes = Data()
+        for _ in 0..<32 {
+            bytes.append(UInt8.random(in: UInt8.min..<UInt8.max))
+        }
+        return .init(string: bytes.base64EncodedString())
     }
 }

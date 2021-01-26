@@ -1,126 +1,159 @@
-import Async
-import Bits
-import Dispatch
-import HTTP
-import Foundation
 import Vapor
-// import WebSocket
 import XCTest
 
-struct MyError: Error {}
+final class WebSocketTests: XCTestCase {
+    func testWebSocketClient() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
 
-class WebSocketTests : XCTestCase {
-    func testClientServer() throws {
-        // Failing on macOS
-//        // TODO: Failing on Linux
-//        let app = WebSocketApplication()
-//        let container = BasicContainer(config: Config(), environment: .development, services: Services(), on: DispatchQueue.global())
-//        let server = HTTPTestServer(container: container)
-//
-//        try server.start(with: app)
-//        sleep(1)
-//
-//        let promise0 = Promise<Void>()
-//        let promise1 = Promise<Void>()
-//
-//        let queue = DispatchQueue(label: "test.client")
-//
-//        let uri = URI(stringLiteral: "ws://localhost:8282/")
-//
-//        do {
-//            _ = try WebSocket.connect(to: uri, worker: queue).do { socket in
-//                let responses = ["test", "cat", "banana"]
-//                let reversedResponses = responses.map {
-//                    String($0.reversed())
-//                }
-//
-//                var count = 0
-//
-//                socket.onText { string in
-//                    XCTAssert(reversedResponses.contains(string), "\(string) does not exist in reversed expectations")
-//                    count += 1
-//
-//                    if count == 3 {
-//                        promise0.complete()
-//                    } else if count > 3 {
-//                        XCTFail()
-//                    }
-//                }.catch { error in
-//                    XCTFail("\(error)")
-//                }
-//
-//                socket.onBinary { blob in
-//                    defer { promise1.complete() }
-//
-//                    guard Array(blob) == [0x00, 0x01, 0x00, 0x02] else {
-//                        XCTFail()
-//                        return
-//                    }
-//                }.catch { error in
-//                    XCTFail("\(error)")
-//                }
-//
-//                for response in responses {
-//                    socket.send(response)
-//                }
-//
-//                Data([
-//                    0x00, 0x01, 0x00, 0x02
-//                ]).withUnsafeBytes { (pointer: BytesPointer) in
-//                    let buffer = ByteBuffer(start: pointer, count: 4)
-//
-//                    socket.send(buffer)
-//                }
-//            }.blockingAwait(timeout: .seconds(10))
-//
-//            try promise0.future.blockingAwait(timeout: .seconds(10))
-//            try promise1.future.blockingAwait(timeout: .seconds(10))
-//        } catch {
-//            XCTFail("Error \(error) connecting to \(uri)")
-//            throw error
-//        }
+        app.get("ws") { req -> EventLoopFuture<String> in
+            let promise = req.eventLoop.makePromise(of: String.self)
+            return WebSocket.connect(
+                to: "ws://echo.websocket.org/",
+                on: req.eventLoop
+            ) { ws in
+                ws.send("Hello, world!")
+                ws.onText { ws, text in
+                    promise.succeed(text)
+                    ws.close().cascadeFailure(to: promise)
+                }
+            }.flatMap {
+                return promise.futureResult
+            }
+        }
+
+        try app.testable().test(.GET, "/ws") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, "Hello, world!")
+        }
     }
-    
-    static let allTests = [
-        ("testClientServer", testClientServer)
-    ]
+
+
+    // https://github.com/vapor/vapor/issues/1997
+    func testWebSocket404() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        app.http.server.configuration.port = 8085
+
+        app.webSocket("bar") { req, ws in
+            ws.close(promise: nil)
+        }
+
+        try app.start()
+
+        do {
+            try WebSocket.connect(
+                to: "ws://localhost:8085/foo",
+                on: app.eventLoopGroup.next()
+            ) { _ in  }.wait()
+            XCTFail("should have failed")
+        } catch {
+            // pass
+        }
+    }
+
+    // https://github.com/vapor/vapor/issues/2009
+    func testWebSocketServer() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+        app.webSocket("foo") { req, ws in
+            ws.send("foo")
+            ws.close(promise: nil)
+        }
+
+        try app.start()
+        let promise = app.eventLoopGroup.next().makePromise(of: String.self)
+        WebSocket.connect(
+            to: "ws://localhost:8080/foo",
+            on: app.eventLoopGroup.next()
+        ) { ws in
+            // do nothing
+            ws.onText { ws, string in
+                promise.succeed(string)
+            }
+        }.cascadeFailure(to: promise)
+
+        try XCTAssertEqual(promise.futureResult.wait(), "foo")
+    }
+
+    func testLifecycleShutdown() throws {
+        let app = Application(.testing)
+        app.http.server.configuration.port = 1337
+
+        final class WebSocketManager: LifecycleHandler {
+            private let lock: Lock
+            private var connections: Set<WebSocket>
+
+            init() {
+                self.lock = .init()
+                self.connections = .init()
+            }
+
+            func track(_ ws: WebSocket) {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                self.connections.insert(ws)
+                ws.onClose.whenComplete { _ in
+                    self.lock.lock()
+                    defer { self.lock.unlock() }
+                    self.connections.remove(ws)
+                }
+            }
+
+            func broadcast(_ message: String) {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                for ws in self.connections {
+                    ws.send(message)
+                }
+            }
+
+            /// Closes all active WebSocket connections
+            func shutdown(_ app: Application) {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                app.logger.debug("Shutting down \(self.connections.count) WebSocket(s)")
+                try! EventLoopFuture<Void>.andAllSucceed(
+                    self.connections.map { $0.close() } ,
+                    on: app.eventLoopGroup.next()
+                ).wait()
+            }
+        }
+
+        let webSockets = WebSocketManager()
+        app.lifecycle.use(webSockets)
+
+        app.webSocket("watcher") { req, ws in
+            webSockets.track(ws)
+            ws.send("hello")
+        }
+
+        try app.start()
+
+        let clientGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try! clientGroup.syncShutdownGracefully() }
+        let connectPromise = app.eventLoopGroup.next().makePromise(of: WebSocket.self)
+        WebSocket.connect(to: "ws://localhost:1337/watcher", on: clientGroup) { ws in
+            connectPromise.succeed(ws)
+        }.cascadeFailure(to: connectPromise)
+
+        let ws = try connectPromise.futureResult.wait()
+        app.shutdown()
+        try ws.onClose.wait()
+    }
+
+    override class func setUp() {
+        XCTAssertTrue(isLoggingConfigured)
+    }
 }
 
-//final class WebSocketApplication: Responder {
-//    var sockets = [UUID: WebSocket]()
-//    
-//    func respond(to req: Request) throws -> Future<Response> {
-//        let promise = Promise<Response>()
-//
-//        guard WebSocket.shouldUpgrade(for: req.http) else {
-//            let res = req.makeResponse()
-//            res.http = try HTTPResponse(status: .ok, body: "hi")
-//            promise.complete(res)
-//            return promise.future
-//        }
-//
-//        let http = try WebSocket.upgradeResponse(for: req.http, with: WebSocketSettings()) { websocket in
-//            let id = UUID()
-//
-//            websocket.onText { text in
-//                let rev = String(text.reversed())
-//                websocket.send(rev)
-//            }.catch(onError: promise.fail)
-//
-//            websocket.onBinary { buffer in
-//                websocket.send(buffer)
-//            }.catch(onError: promise.fail)
-//
-//            self.sockets[id] = websocket
-//
-//            websocket.finally {
-//                self.sockets[id] = nil
-//            }
-//        }
-//        let res = req.makeResponse()
-//        res.http = http
-//        promise.complete(res)
-//
-//        return promise.future
-//    }
-//}
+extension WebSocket: Hashable {
+    public static func == (lhs: WebSocket, rhs: WebSocket) -> Bool {
+        lhs === rhs
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        ObjectIdentifier(self).hash(into: &hasher)
+    }
+}

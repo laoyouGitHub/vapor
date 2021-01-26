@@ -1,18 +1,29 @@
-/// A basic, closure-based responder.
+/// A basic, closure-based `Responder`.
 public struct BasicResponder: Responder {
-    /// Responder closure
-    public typealias Closure = (Request) throws -> Future<Response>
-
     /// The stored responder closure.
-    public let closure: Closure
+    private let closure: (Request) throws -> EventLoopFuture<Response>
 
-    /// Create a new basic responder.
-    public init(closure: @escaping Closure) {
+    /// Create a new `BasicResponder`.
+    ///
+    ///     let notFound: Responder = BasicResponder { req in
+    ///         let res = req.response(http: .init(status: .notFound))
+    ///         return req.eventLoop.newSucceededFuture(result: res)
+    ///     }
+    ///
+    /// - parameters:
+    ///     - closure: Responder closure.
+    public init(
+        closure: @escaping (Request) throws -> EventLoopFuture<Response>
+    ) {
         self.closure = closure
     }
 
-    /// See: .Responder.respond
-    public func respond(to req: Request) throws -> Future<Response> {
-        return try closure(req)
+    /// See `Responder`.
+    public func respond(to request: Request) -> EventLoopFuture<Response> {
+        do {
+            return try closure(request)
+        } catch {
+            return request.eventLoop.makeFailedFuture(error)
+        }
     }
 }
